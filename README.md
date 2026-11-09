@@ -41,3 +41,11 @@ Requirements: macOS 15 or later, Xcode 16 or later, and an Apple ID added in Xco
 - `Shared/`: account config, Keychain token store and refresh, WebDAV/Graph client, XML parser, pinned-items store
 - `FileProvider/`: `NSFileProviderReplicatedExtension`, enumerators and the etag-based change scanner
 - `App/`: SwiftUI app (model, views, sign-in flow, File Provider bridge)
+
+## License
+
+Copyright (C) 2026 crispy-09
+
+Skyfolder is free software: you can redistribute it and/or modify it under the terms of the
+[GNU General Public License v3.0](LICENSE) as published by the Free Software Foundation, either version 3
+of the License, or (at your option) any later version. It is distributed WITHOUT ANY WARRANTY.
