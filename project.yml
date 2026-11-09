@@ -1,0 +1,80 @@
+name: Skyfolder
+options:
+  bundleIdPrefix: io.github.crispy-09
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    DEVELOPMENT_TEAM: V4S4N7FT58
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_HARDENED_RUNTIME: YES
+    MACOSX_DEPLOYMENT_TARGET: "15.0"
+    APP_GROUP_ID: V4S4N7FT58.io.github.crispy-09.skyfolder
+targets:
+  Skyfolder:
+    type: application
+    platform: macOS
+    sources:
+      - App
+      - Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.crispy-09.skyfolder
+        PRODUCT_NAME: Skyfolder
+        CODE_SIGN_ENTITLEMENTS: App/App.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GENERATE_INFOPLIST_FILE: NO
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Skyfolder
+        CFBundleName: Skyfolder
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.productivity
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        NSHumanReadableCopyright: ""
+        AppGroupID: $(APP_GROUP_ID)
+    dependencies:
+      - target: FileProviderExt
+        embed: true
+        codeSign: true
+  FileProviderExt:
+    type: app-extension
+    platform: macOS
+    sources:
+      - FileProvider
+      - Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.crispy-09.skyfolder.FileProvider
+        PRODUCT_NAME: SkyfolderFileProvider
+        CODE_SIGN_ENTITLEMENTS: FileProvider/FileProvider.entitlements
+        GENERATE_INFOPLIST_FILE: NO
+    info:
+      path: FileProvider/Info.plist
+      properties:
+        CFBundleDisplayName: Skyfolder
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        AppGroupID: $(APP_GROUP_ID)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.fileprovider-nonui
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).FileProviderExtension
+          NSExtensionFileProviderSupportsEnumeration: true
+          NSExtensionFileProviderDocumentGroup: $(APP_GROUP_ID)
+          NSExtensionFileProviderActions:
+            - NSExtensionFileProviderActionIdentifier: io.github.crispy-09.skyfolder.action.keepOffline
+              NSExtensionFileProviderActionName: Make Available Offline
+              NSExtensionFileProviderActionActivationRule: "SUBQUERY ( fileproviderItems, $fileproviderItem, $fileproviderItem.userInfo.pinned != YES ).@count > 0"
+            - NSExtensionFileProviderActionIdentifier: io.github.crispy-09.skyfolder.action.onlineOnly
+              NSExtensionFileProviderActionName: Remove Offline Copy
+              NSExtensionFileProviderActionActivationRule: "SUBQUERY ( fileproviderItems, $fileproviderItem, $fileproviderItem.userInfo.pinned == YES ).@count > 0"
+            - NSExtensionFileProviderActionIdentifier: io.github.crispy-09.skyfolder.action.openWeb
+              NSExtensionFileProviderActionName: Open in OpenCloud Web
+              NSExtensionFileProviderActionActivationRule: "fileproviderItems.@count == 1"

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <!-- Not sandboxed (like other sync clients) so the app can open files in ~/Library/CloudStorage.
+       The File Provider extension remains sandboxed. -->
+  <key>com.apple.security.application-groups</key><array><string>V4S4N7FT58.io.github.crispy-09.skyfolder</string></array>
+</dict></plist>
