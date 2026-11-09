@@ -1,6 +1,6 @@
 # Skyfolder
 
-A Google-Drive-style macOS desktop client for [OpenCloud](https://opencloud.eu) servers.
+A Google-Drive-style desktop client for [OpenCloud](https://opencloud.eu) servers, for macOS, Windows and Linux.
 
 > Independent project. Not affiliated with OpenCloud GmbH or Google.
 
@@ -10,7 +10,18 @@ A Google-Drive-style macOS desktop client for [OpenCloud](https://opencloud.eu) 
   Use **Make Available Offline** (Finder right-click or the app) to keep a file or folder downloaded. **Remove Offline Copy** frees the space again.
 - Runs in the menu bar after the window closes. "Open at login" is in Settings.
 
-## Build & install
+## Platforms
+
+| | App | File manager integration | Status |
+|---|---|---|---|
+| macOS | SwiftUI (repo root) | Finder, File Provider extension | Tested |
+| Linux | Tauri (`desktop/`) | `~/Skyfolder`, FUSE mount | Tested on Ubuntu 26.04 (arm64) |
+| Windows | Tauri (`desktop/`) | `%USERPROFILE%\Skyfolder`, Cloud Files (like OneDrive) | **Untested**: builds, but hasn't been run on Windows yet |
+
+The Windows and Linux app has the same window as the Mac app: the same views, filters, uploads and
+downloads, trash and offline handling.
+
+## Build & install (macOS)
 
 ```sh
 brew install xcodegen      # once
@@ -25,14 +36,49 @@ Requirements: macOS 15 or later, Xcode 16 or later, and an Apple ID added in Xco
 (the app group must start with your team ID). With a free Apple ID, the provisioning profile expires after
 7 days. When it does, re-run `./scripts/install.sh`.
 
+## Windows & Linux
+
+Installers (`.msi`/`-setup.exe`, `.deb`/`.rpm`/`.AppImage`) are built by GitHub Actions
+([`desktop.yml`](.github/workflows/desktop.yml)). They are unsigned, so Windows SmartScreen will warn on first run.
+
+To build it yourself, install Rust (rustup) and Node.js 20 or later. On Linux, also install the Tauri
+dependencies and FUSE 3:
+
+```sh
+# Debian/Ubuntu
+sudo apt install libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev \
+  libssl-dev libdbus-1-dev fuse3
+
+cd desktop
+npm ci
+npx tauri build        # installers land in desktop/target/release/bundle/
+npx tauri dev          # or run it straight from source
+```
+
+**Linux:** your drive is mounted at `~/Skyfolder` while the app runs (it keeps running in the tray when the
+window is closed). Files download when opened and are cached (5 GB by default, oldest evicted first;
+set `SKYFOLDER_CACHE_LIMIT_MB` to change it). Saving a file uploads it. "Make available offline" keeps
+files in the cache permanently.
+
+**Windows:** Skyfolder registers a cloud-files folder at `%USERPROFILE%\Skyfolder`. It shows in
+Explorer's navigation pane with the usual cloud and check-mark icons, and Explorer's "Always keep on this
+device" and "Free up space" work. Editor temp files (`~$…`, `*.tmp`) are never uploaded. Signing out
+removes the folder. If it still holds changes that never reached the server, it is renamed to
+`Skyfolder (unsynced files)` instead.
+
+`desktop/crates/cli` is a small command-line client used for testing (`skyfolder-cli selftest`,
+`ls`, `cat`, `mount`).
+
 ## Server notes (OpenCloud 8.x)
 
 - Sign-in: OIDC code + PKCE through the browser, client `OpenCloudDesktop`, loopback redirect `http://127.0.0.1:<port>`.
-  Tokens are stored in the Keychain and shared with the extension through the app group.
+  Tokens are stored in the Keychain on macOS (shared with the extension through the app group), Windows
+  Credential Manager on Windows, and the Secret Service keyring on Linux. Without a keyring, Linux falls back
+  to a file only your user can read.
 - "Starred" is stored as the server tag `favorite`, because the favorites capability is off on stock OpenCloud.
   Starred items also show the tag in the web UI.
 - Recent = KQL search `mtime:"last 30 days"`. Search = `name:"*term*"`.
-- Deleting (app or Finder) moves items to the OpenCloud trash bin.
+- Deleting (in the app or the file manager) moves items to the OpenCloud trash bin.
 - Conflicts: if a file changed on the server while you edited it locally, your version is uploaded as
   `name (conflicted copy <date>).ext` and the server version is kept.
 
@@ -41,6 +87,13 @@ Requirements: macOS 15 or later, Xcode 16 or later, and an Apple ID added in Xco
 - `Shared/`: account config, Keychain token store and refresh, WebDAV/Graph client, XML parser, pinned-items store
 - `FileProvider/`: `NSFileProviderReplicatedExtension`, enumerators and the etag-based change scanner
 - `App/`: SwiftUI app (model, views, sign-in flow, File Provider bridge)
+- `desktop/`: Windows/Linux app
+  - `src/`: Svelte UI
+  - `src-tauri/`: Tauri shell and commands
+  - `crates/core`: WebDAV/Graph client, sign-in, token storage
+  - `crates/fuse`: Linux FUSE file system
+  - `crates/winsync`: Windows Cloud Files engine
+  - `crates/cli`: test CLI
 
 ## License
 

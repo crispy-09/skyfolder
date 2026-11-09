@@ -1,0 +1,34 @@
+[package]
+name = "skyfolder"
+description = "Skyfolder: a Drive-style desktop client for OpenCloud"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "skyfolder_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7.4", features = [] }
+
+[dependencies]
+skyfolder-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+base64 = "0.22"
+tauri = { version = "2.12.5", features = ["tray-icon", "image-png"] }
+tauri-plugin-dialog = "2.8.4"
+tauri-plugin-opener = "2.7.2"
+tauri-plugin-single-instance = "2.5.5"
+tauri-plugin-autostart = "2.7.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+skyfolder-fuse.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+skyfolder-winsync.workspace = true

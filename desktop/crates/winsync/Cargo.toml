@@ -1,0 +1,16 @@
+[package]
+name = "skyfolder-winsync"
+description = "Windows Cloud Files (cfapi) sync engine for Skyfolder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+skyfolder-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+cloud-filter = "=0.0.7"

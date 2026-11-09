@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Skyfolder",
+  "version": "1.0.0",
+  "identifier": "io.github.crispy-09.skyfolder.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Skyfolder",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 900,
+        "minHeight": 560,
+        "dragDropEnabled": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "appimage", "rpm", "nsis", "msi"],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico", "icons/icon.png"],
+    "category": "Productivity",
+    "shortDescription": "Drive-style desktop client for OpenCloud",
+    "longDescription": "Skyfolder lets you browse, sync and access the files on your OpenCloud server in a familiar drive-style app, with on-demand files in your file manager.",
+    "license": "GPL-3.0-or-later",
+    "linux": {
+      "deb": { "depends": ["fuse3"] },
+      "rpm": { "depends": ["fuse3"] }
+    }
+  }
+}

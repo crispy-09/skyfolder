@@ -1,0 +1,19 @@
+[package]
+name = "skyfolder-cli"
+description = "Headless Skyfolder tool: API self-test and (Linux) FUSE mount"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "skyfolder-cli"
+path = "src/main.rs"
+
+[dependencies]
+skyfolder-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+skyfolder-fuse.workspace = true
