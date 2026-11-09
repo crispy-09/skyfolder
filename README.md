@@ -16,7 +16,7 @@ A Google-Drive-style desktop client for [OpenCloud](https://opencloud.eu) server
 |---|---|---|---|
 | macOS | SwiftUI (repo root) | Finder, File Provider extension | Tested |
 | Linux | Tauri (`desktop/`) | `~/Skyfolder`, FUSE mount | Tested on Ubuntu 26.04 (arm64) |
-| Windows | Tauri (`desktop/`) | `%USERPROFILE%\Skyfolder`, Cloud Files (like OneDrive) | **Untested**: builds, but hasn't been run on Windows yet |
+| Windows | Tauri (`desktop/`) | `%USERPROFILE%\Skyfolder`, Cloud Files (like OneDrive) | Tested on Windows (x64) |
 
 The Windows and Linux app has the same window as the Mac app: the same views, filters, uploads and
 downloads, trash and offline handling.
@@ -38,7 +38,7 @@ Requirements: macOS 15 or later, Xcode 16 or later, and an Apple ID added in Xco
 
 ## Windows & Linux
 
-Installers (`.msi`/`-setup.exe`, `.deb`/`.rpm`/`.AppImage`) are built by GitHub Actions
+Download installers from [Releases](https://github.com/crispy-09/skyfolder/releases) (`desktop-v*`). They're built by GitHub Actions
 ([`desktop.yml`](.github/workflows/desktop.yml)). They are unsigned, so Windows SmartScreen will warn on first run.
 
 To build it yourself, install Rust (rustup) and Node.js 20 or later. On Linux, also install the Tauri
