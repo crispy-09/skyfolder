@@ -4,6 +4,34 @@ import AppKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     // Keep running in the menu bar after the window closes, like Drive for desktop.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let nc = NotificationCenter.default
+        // A real window appearing (main window, Settings) brings the Dock icon back…
+        nc.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { note in
+            guard let w = note.object as? NSWindow, AppDelegate.isAppWindow(w) else { return }
+            MainActor.assumeIsolated { AppDelegate.showInDock() }
+        }
+        // …and closing the last one hides it, leaving only the menu bar icon.
+        nc.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { note in
+            guard let closing = note.object as? NSWindow, AppDelegate.isAppWindow(closing) else { return }
+            // Let the close finish before checking what's left on screen.
+            DispatchQueue.main.async {
+                let others = NSApp.windows.contains { $0 !== closing && $0.isVisible && AppDelegate.isAppWindow($0) }
+                if !others { NSApp.setActivationPolicy(.accessory) }
+            }
+        }
+    }
+
+    /// Titled document-style windows; excludes the menu bar extra's status item and menus.
+    static func isAppWindow(_ w: NSWindow) -> Bool {
+        w.styleMask.contains(.titled) && !(w is NSPanel) && w.level == .normal
+    }
+
+    @MainActor static func showInDock() {
+        if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
+        NSApp.activate(ignoringOtherApps: true)
+    }
 }
 
 @main
@@ -56,6 +84,7 @@ struct SkyfolderApp: App {
 struct MenuBarContent: View {
     @Environment(DriveModel.self) private var model
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         if let acc = model.account {
@@ -63,15 +92,22 @@ struct MenuBarContent: View {
             if model.sessionExpired { Text("Sign-in required") }
             else if let q = model.quota { Text("\(q.used.formattedBytes) used") }
             Divider()
-            Button("Open Skyfolder") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
+            Button("Open Skyfolder") { showMain() }
             Button("Open in Finder") { model.openInFinder() }.disabled(!model.finderEnabled)
             Button("Open Web Version") { model.openWeb() }
         } else {
-            Button("Sign In…") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
+            Button("Sign In…") { showMain() }
         }
         Divider()
-        SettingsLink { Text("Settings…") }
+        // The app is menu-bar-only while no window is open, so it must become a regular
+        // app again before a window can come to the front.
+        Button("Settings…") { AppDelegate.showInDock(); openSettings() }.keyboardShortcut(",")
         Button("Quit Skyfolder") { NSApp.terminate(nil) }.keyboardShortcut("q")
+    }
+
+    private func showMain() {
+        AppDelegate.showInDock()
+        openWindow(id: "main")
     }
 }
 
