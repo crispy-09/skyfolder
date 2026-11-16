@@ -64,16 +64,50 @@ final class Transfer: Identifiable {
     var fraction: Double = 0
     var state: State = .running
     var resultURL: URL?
+    /// Counts bytes: `completedUnitCount` of `totalUnitCount` (the total stays at 1 until the size is known).
     let progress = Progress(totalUnitCount: 1)
+    var doneBytes: Int64 = 0
+    /// 0 while the full size isn't known (e.g. a folder being zipped by the server).
+    var totalBytes: Int64 = 0
+    /// Bytes per second, averaged over the last few seconds.
+    var speed: Double = 0
     private var observation: NSKeyValueObservation?
+    private var lastSample: (time: TimeInterval, bytes: Int64)?
 
     init(kind: Kind, name: String, isFolder: Bool = false) {
         self.kind = kind
         self.name = name
         self.isFolder = isFolder
-        observation = progress.observe(\.fractionCompleted) { [weak self] p, _ in
-            let f = p.fractionCompleted
-            DispatchQueue.main.async { self?.fraction = f }
+        observation = progress.observe(\.completedUnitCount) { [weak self] p, _ in
+            let done = p.completedUnitCount, total = p.totalUnitCount, f = p.fractionCompleted
+            DispatchQueue.main.async { self?.record(done: done, total: total, fraction: f) }
+        }
+    }
+
+    private func record(done: Int64, total: Int64, fraction f: Double) {
+        fraction = f
+        doneBytes = done
+        totalBytes = total > 1 ? total : 0
+        let now = Date.timeIntervalSinceReferenceDate
+        guard let last = lastSample else { lastSample = (now, done); return }
+        let dt = now - last.time
+        guard dt >= 1 else { return }
+        let current = Double(max(0, done - last.bytes)) / dt
+        speed = speed == 0 ? current : speed * 0.6 + current * 0.4   // smooth out bursts
+        lastSample = (now, done)
+    }
+
+    /// "3.1 MB of 20 MB · 850 KB/s" while running, the size once finished.
+    var detail: String {
+        switch state {
+        case .running:
+            var s = totalBytes > 0 ? "\(doneBytes.formattedBytes) of \(totalBytes.formattedBytes)"
+                                   : (doneBytes > 0 ? doneBytes.formattedBytes : "Starting…")
+            if speed >= 1 { s += " · \(Int64(speed).formattedBytes)/s" }
+            return s
+        case .done: return totalBytes > 0 ? totalBytes.formattedBytes : "Done"
+        case .failed(let msg): return msg
+        case .cancelled: return "Canceled"
         }
     }
 }
@@ -129,8 +163,11 @@ final class DriveModel {
     var transfers: [Transfer] = []
     var transfersCollapsed = false
     var pinned: [String: PinnedStore.Info] = PinnedStore.all()
-    /// Files whose contents are currently on this Mac (downloaded on demand or kept offline).
-    var downloaded: Set<String> = []
+    /// Paths (relative to the drive root) whose contents are on this Mac right now, read from the Finder folder
+    /// itself: downloaded files, and folders in which everything is downloaded.
+    var onDisk: Set<String> = []
+    /// The top-most entries of `onDisk` (a fully downloaded folder stands for everything inside it).
+    private var onDiskTop: [String] = []
     var lastSync: Date?
 
     private var pollTimer: Timer?
@@ -203,14 +240,18 @@ final class DriveModel {
     func signOut() {
         pollTimer?.invalidate()
         Task {
-            await FileProviderBridge.unregister()
+            if let kept = await FileProviderBridge.unregister() {
+                // Edits that never reached the server were set aside instead of being deleted.
+                NSWorkspace.shared.activateFileViewerSelecting([kept])
+            }
             await TokenProvider.shared.clear()
             AccountConfig.clear()
             PinnedStore.clearAll()
             ThumbnailLoader.shared.clearAll()
             try? FileManager.default.removeItem(at: Self.openCopiesDir)
             pinned = [:]
-            downloaded = []
+            onDisk = []
+            onDiskTop = []
             account = nil
             client = nil
             items = []
@@ -314,19 +355,66 @@ final class DriveModel {
                     let listing = try await client.listFolder(path: path)
                     if gen == loadGeneration { currentFolder = listing.folder }
                     result = listing.children
+                    // Files copied in through Finder that haven't reached the server yet.
+                    if finderEnabled, let root = await FileProviderBridge.rootURL() {
+                        // A file part-way through a chunked upload already exists on the server, but empty.
+                        let known = Set(result.filter { $0.isFolder || $0.size > 0 }
+                            .map { $0.name.precomposedStringWithCanonicalMapping })
+                        let local = await Task.detached { Self.uploadingFiles(root: root.path, folder: path, known: known) }.value
+                        let replaced = Set(local.map { $0.name.precomposedStringWithCanonicalMapping })
+                        result.removeAll { !$0.isFolder && $0.size == 0 && replaced.contains($0.name.precomposedStringWithCanonicalMapping) }
+                        result += local
+                    }
                 case .recent:
                     result = try await client.search("mtime:\"last 30 days\"", limit: 300).filter { !$0.isFolder }
                 case .starred:
                     result = try await client.search("tag:\(AppConstants.favoriteTag)", limit: 500)
                 case .offline:
                     await refreshDownloadedNow()
-                    let ids = Array(Set(PinnedStore.all().keys).union(downloaded))
-                    result = await withTaskGroup(of: RemoteItem?.self) { group in
+                    let pins = PinnedStore.all()
+                    let ids = Array(pins.keys)
+                    // A folder marked offline stands for everything inside it, so don't also list its files.
+                    let pinnedFolders = pins.values.filter(\.isFolder).compactMap(\.path)
+                        .map { $0.precomposedStringWithCanonicalMapping }
+                    func insidePinnedFolder(_ path: String) -> Bool {
+                        let p = path.precomposedStringWithCanonicalMapping
+                        return pinnedFolders.contains { $0.isEmpty || p.hasPrefix($0 + "/") }
+                    }
+                    let paths = Array(onDiskTop.filter { !insidePinnedFolder($0) }.prefix(2000))
+                    let found = await withTaskGroup(of: RemoteItem?.self) { group in
                         for id in ids { group.addTask { try? await client.item(id: id) } }
+                        for p in paths {
+                            group.addTask {
+                                do {
+                                    var it = try await client.stat(client.spacePathURL(p))
+                                    if it.path == nil { it.path = p }
+                                    // Empty on the server but not here: a chunked upload is still in progress.
+                                    if !it.isFolder, it.size == 0, let root = await FileProviderBridge.rootURL(),
+                                       let local = Self.uploadingFile(root: root.path, path: p), local.size > 0 {
+                                        return local
+                                    }
+                                    return it
+                                } catch DAVError.notFound {
+                                    // On this Mac but not on the server yet: still uploading.
+                                    guard let root = await FileProviderBridge.rootURL() else { return nil }
+                                    return Self.uploadingFile(root: root.path, path: p)
+                                } catch {
+                                    return nil
+                                }
+                            }
+                        }
                         var out: [RemoteItem] = []
                         for await r in group { if let r { out.append(r) } }
                         return out
                     }
+                    var seen = Set<String>()
+                    result = found.filter { seen.insert($0.id).inserted }
+                        .filter { it in
+                            // Also hide an item that is marked offline itself but sits inside an offline folder.
+                            guard let path = it.path ?? pins[it.id]?.path else { return true }
+                            return !insidePinnedFolder(path)
+                        }
+                        .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
                     // item(id:) lookups are id-based; recover paths from what we stored at pin time.
                     let info = PinnedStore.all()
                     let records = DownloadedStore.all()
@@ -400,6 +488,8 @@ final class DriveModel {
         } else {
             selection = [item.id]
         }
+        // Files that are still uploading can't be acted on yet (the server doesn't know them).
+        selection = selection.filter { !$0.hasPrefix(RemoteItem.localPrefix) }
         lastSelected = item.id
     }
 
@@ -417,34 +507,151 @@ final class DriveModel {
         Task { await refreshDownloadedNow() }
     }
 
-    /// Checks each recorded download against the real file: present and not "dataless" (a cloud placeholder).
+    /// Walks the Finder folder and returns what is really downloaded. Placeholders ("dataless" files and folders)
+    /// are never entered, so this touches only local data and never triggers a download.
+    nonisolated private static func scanDisk(root: String) -> (all: Set<String>, top: [String]) {
+        var all = Set<String>()
+        var raw: [String: String] = [:]   // normalized -> path as stored on disk (used for server lookups)
+        var budget = 300_000
+        /// Returns true if everything at `rel` is on disk.
+        func visit(_ full: String, _ rel: String) -> Bool {
+            var st = stat()
+            guard lstat(full, &st) == 0, st.st_flags & UInt32(SF_DATALESS) == 0 else { return false }
+            budget -= 1
+            if budget < 0 { return false }
+            if st.st_mode & S_IFMT == S_IFDIR {
+                guard let names = try? FileManager.default.contentsOfDirectory(atPath: full) else { return false }
+                var complete = true
+                for n in names where !n.hasPrefix(".") {
+                    let childRel = rel.isEmpty ? n : rel + "/" + n
+                    if !visit(full + "/" + n, childRel) { complete = false }
+                }
+                guard complete, !rel.isEmpty else { return false }
+            }
+            let key = rel.precomposedStringWithCanonicalMapping
+            all.insert(key)
+            raw[key] = rel
+            return true
+        }
+        _ = visit(root, "")
+        let top = all.filter { p in
+            guard let i = p.lastIndex(of: "/") else { return true }
+            return !all.contains(String(p[..<i]))
+        }
+        return (all, top.map { raw[$0] ?? $0 })
+    }
+
+    /// A made-up entry for a local file the server doesn't have yet (nil for folders and placeholders).
+    nonisolated private static func uploadingFile(root: String, path: String) -> RemoteItem? {
+        var st = stat()
+        guard lstat(root + "/" + path, &st) == 0, st.st_mode & S_IFMT == S_IFREG,
+              st.st_flags & UInt32(SF_DATALESS) == 0 else { return nil }
+        return .uploading(path: path, size: Int64(st.st_size),
+                          modified: Date(timeIntervalSince1970: TimeInterval(st.st_mtimespec.tv_sec)))
+    }
+
+    /// Local files in one folder of the Finder location whose names the server listing doesn't contain.
+    nonisolated private static func uploadingFiles(root: String, folder: String, known: Set<String>) -> [RemoteItem] {
+        let dir = folder.isEmpty ? root : root + "/" + folder
+        var st = stat()
+        // Never look inside a placeholder folder: that would make the system fetch its listing.
+        guard lstat(dir, &st) == 0, st.st_flags & UInt32(SF_DATALESS) == 0,
+              let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return [] }
+        return names.filter { !$0.hasPrefix(".") && !known.contains($0.precomposedStringWithCanonicalMapping) }
+            .compactMap { uploadingFile(root: root, path: folder.isEmpty ? $0 : folder + "/" + $0) }
+    }
+
+    /// Reads the real on-disk state, and unpins files the user removed with Finder's "Remove Download".
     func refreshDownloadedNow() async {
         guard finderEnabled, let root = await FileProviderBridge.rootURL() else { return }
+        let scan = await Task.detached(priority: .utility) { Self.scanDisk(root: root.path) }.value
+        if scan.all != onDisk {
+            onDisk = scan.all
+            onDiskTop = scan.top
+        }
         let records = DownloadedStore.all()
-        var present = Set<String>()
         var gone: [String] = []
+        var evicted: [(id: String, etag: String)] = []
+        let pins = PinnedStore.all()
         for (id, rec) in records {
             guard let path = rec.path else { continue }
             var st = stat()
             let full = path.isEmpty ? root.path : root.appendingPathComponent(path).path
             if lstat(full, &st) == 0 {
-                if st.st_flags & UInt32(SF_DATALESS) == 0 { present.insert(id) }
+                if st.st_flags & UInt32(SF_DATALESS) == 0 { continue }
+                if let pin = pins[id], !pin.isFolder, let etag = rec.etag { evicted.append((id, etag)) }
             } else if errno == ENOENT {
                 gone.append(id)
             }
         }
         DownloadedStore.remove(gone)
-        if present != downloaded { downloaded = present }
+        // Pinned files that were already on disk when they were pinned have no record yet; without one a later
+        // "Remove Download" could not be recognised.
+        if let client {
+            for (id, pin) in pins where !pin.isFolder && records[id]?.etag == nil {
+                guard let path = pin.path, onDisk.contains(path.precomposedStringWithCanonicalMapping),
+                      let current = try? await client.item(id: id) else { continue }
+                DownloadedStore.record(id, name: pin.name, path: path, etag: current.etag)
+            }
+        }
+        // A pinned file that went back to the cloud at the version we downloaded was removed by the user
+        // (Finder's "Remove Download"): honour that by unpinning it. A different etag just means a newer
+        // version is still being fetched.
+        if let client {
+            for (id, etag) in evicted {
+                guard let current = try? await client.item(id: id), current.etag == etag else { continue }
+                PinnedStore.set(id, pinned: false, info: nil)
+                DownloadedStore.remove([id])
+            }
+            if !evicted.isEmpty { pinned = PinnedStore.all() }
+        }
     }
 
-    /// True if the item, or a folder containing it, is available offline.
+    /// True if the item is on this Mac (a folder counts once everything in it is), or is marked to be kept offline
+    /// and still downloading.
     func isOffline(_ item: RemoteItem) -> Bool {
-        if pinned[item.id] != nil || downloaded.contains(item.id) { return true }
-        guard let p = item.path else { return false }
-        return pinned.values.contains { info in
-            guard info.isFolder, let fp = info.path else { return false }
-            return fp.isEmpty || p.hasPrefix(fp + "/")
+        if pinned[item.id] != nil { return true }
+        guard let p = item.path, !p.isEmpty else { return false }
+        return onDisk.contains(p.precomposedStringWithCanonicalMapping)
+    }
+
+    /// True while "Remove all offline copies" is running.
+    var removingOffline = false
+
+    /// Frees up this Mac: clears every "available offline" mark and turns every downloaded file back into an
+    /// online-only placeholder. Nothing is deleted from the server, and files that haven't finished uploading are
+    /// left alone (the system refuses to evict those).
+    func removeAllOfflineCopies() {
+        guard finderEnabled, !removingOffline else { return }
+        removingOffline = true
+        Task {
+            for id in PinnedStore.all().keys { PinnedStore.set(id, pinned: false, info: nil) }
+            pinned = PinnedStore.all()
+            FileProviderBridge.signalChanges()
+            await refreshDownloadedNow()
+            let targets = onDiskTop
+            var removed = 0
+            if let root = await FileProviderBridge.rootURL() {
+                removed = await Task.detached(priority: .userInitiated) {
+                    var n = 0
+                    for path in targets {
+                        if (try? FileManager.default.evictUbiquitousItem(at: root.appendingPathComponent(path))) != nil { n += 1 }
+                    }
+                    return n
+                }.value
+            }
+            await refreshDownloadedNow()
+            removingOffline = false
+            let left = onDisk.count
+            showToast(left == 0 ? "Removed all offline copies from this Mac"
+                      : "Removed \(removed) offline \(removed == 1 ? "copy" : "copies"). \(left) still uploading or in use were kept.")
+            if section == .offline { reload(silent: true) }
         }
+    }
+
+    /// True if the item is kept current automatically: marked "available offline" itself or inside such a folder.
+    func isKept(_ item: RemoteItem) -> Bool {
+        PinnedStore.covers(item.id, path: item.path, in: pinned)
     }
 
     func setOffline(_ targets: [RemoteItem], on: Bool) {
@@ -454,11 +661,21 @@ final class DriveModel {
             return
         }
         Task {
-            await FileProviderBridge.setOffline(targets, on: on, rootID: acc.rootID)
+            var contained: [RemoteItem] = []
+            if on, let client {
+                for t in targets where t.isFolder { contained += await client.files(under: t.id, path: t.path) }
+            }
+            await FileProviderBridge.setOffline(targets, contained: contained, on: on, rootID: acc.rootID)
             pinned = PinnedStore.all()
             let what = targets.count == 1 ? "“\(targets[0].name)”" : "\(targets.count) items"
             showToast(on ? "\(what) will be available offline" : "\(what) removed from this Mac (still in the cloud)")
             if section == .offline { reload(silent: true) }
+            // Downloads and evictions land a little later; pick the new state up without waiting for the next poll.
+            for delay in [2, 6, 15] {
+                try? await Task.sleep(for: .seconds(delay))
+                await refreshDownloadedNow()
+                if section == .offline { reload(silent: true) }
+            }
         }
     }
 
@@ -751,6 +968,8 @@ final class DriveModel {
                             t.state = .done
                         } catch is CancellationError {
                             t.state = .cancelled
+                        } catch let e as URLError where e.code == .cancelled {
+                            t.state = .cancelled
                         } catch {
                             t.state = .failed(error.localizedDescription)
                         }
@@ -763,7 +982,26 @@ final class DriveModel {
         }
     }
 
+    /// Uploads a file or folder. If the upload is cancelled, everything it had added so far is taken back
+    /// (moved to the server's trash bin), so a cancelled upload doesn't leave half a folder behind.
     private func uploadEntry(_ url: URL, parentID: String, client: DAVClient, transfer: Transfer) async throws {
+        var added: [String] = []   // ids of folders created and files uploaded by this upload, in order
+        do {
+            try await uploadEntry(url, parentID: parentID, client: client, transfer: transfer, added: &added)
+        } catch {
+            let cancelled = transfer.progress.isCancelled || error is CancellationError
+                || (error as? URLError)?.code == .cancelled
+            if cancelled {
+                // Newly created folders take their contents with them; ids already gone are ignored.
+                for id in added { try? await client.delete(id: id) }
+                throw CancellationError()
+            }
+            throw error
+        }
+    }
+
+    private func uploadEntry(_ url: URL, parentID: String, client: DAVClient, transfer: Transfer,
+                             added: inout [String]) async throws {
         let fm = FileManager.default
         let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
         if !isDir {
@@ -771,8 +1009,9 @@ final class DriveModel {
             let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
             transfer.progress.totalUnitCount = Int64(max(size, 1))
             let mtime = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
-            _ = try await client.upload(file: url, to: .new(parentID: parentID, name: name), modified: mtime,
-                                        progress: transfer.progress)
+            let item = try await client.upload(file: url, to: .new(parentID: parentID, name: name), modified: mtime,
+                                               progress: transfer.progress)
+            added.append(item.id)
             return
         }
         // Folder: count files for progress, then mirror the tree.
@@ -783,25 +1022,32 @@ final class DriveModel {
                 files.append(f)
             }
         }
-        transfer.progress.totalUnitCount = Int64(max(files.count, 1))
+        let sizes = files.map { Int64((try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
+        transfer.progress.totalUnitCount = max(sizes.reduce(0, +), 1)
+        var sentBefore: Int64 = 0   // bytes of the files already finished
         let rootName = url.lastPathComponent
         var folderIDs: [String: String] = [:]
         let top: RemoteItem
-        do { top = try await client.createFolder(parentID: parentID, name: rootName) }
-        catch DAVError.alreadyExists {
+        do {
+            top = try await client.createFolder(parentID: parentID, name: rootName)
+            added.append(top.id)
+        } catch DAVError.alreadyExists {
             guard let existing = try await client.child(parentID: parentID, name: rootName) else { throw DAVError.alreadyExists }
             top = existing
         }
         folderIDs[""] = top.id
 
+        var createdFolders: [String] = []
         func folderID(for rel: String) async throws -> String {
             if let id = folderIDs[rel] { return id }
             let parentRel = (rel as NSString).deletingLastPathComponent
             let pid = try await folderID(for: parentRel == "/" ? "" : parentRel)
             let name = (rel as NSString).lastPathComponent
             let f: RemoteItem
-            do { f = try await client.createFolder(parentID: pid, name: name) }
-            catch DAVError.alreadyExists {
+            do {
+                f = try await client.createFolder(parentID: pid, name: name)
+                createdFolders.append(f.id)
+            } catch DAVError.alreadyExists {
                 guard let ex = try await client.child(parentID: pid, name: name) else { throw DAVError.alreadyExists }
                 f = ex
             }
@@ -816,17 +1062,32 @@ final class DriveModel {
                 _ = try await folderID(for: rel)
             }
         }
-        for f in files {
+        for (index, f) in files.enumerated() {
             try Task.checkCancellation()
+            if transfer.progress.isCancelled { throw CancellationError() }
             let rel = String(f.path.dropFirst(url.path.count + 1))
             let dirRel = (rel as NSString).deletingLastPathComponent
             let pid = try await folderID(for: dirRel)
             let mtime = try? f.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
             // Never overwrite: if a file with this name already exists, keep both (like "name (1).ext").
             let name = try await client.availableName(parentID: pid, desired: f.lastPathComponent)
-            _ = try await client.upload(file: f, to: .new(parentID: pid, name: name), modified: mtime)
-            transfer.progress.completedUnitCount += 1
+            added.append(contentsOf: createdFolders); createdFolders = []
+            // Cancelling the transfer stops the file that is in flight, not just the ones after it.
+            let fileProgress = Progress()
+            transfer.progress.cancellationHandler = { fileProgress.cancel() }
+            let base = sentBefore
+            let overall = transfer.progress
+            let watch = fileProgress.observe(\.completedUnitCount) { p, _ in
+                overall.completedUnitCount = base + p.completedUnitCount
+            }
+            defer { watch.invalidate() }
+            let item = try await client.upload(file: f, to: .new(parentID: pid, name: name), modified: mtime,
+                                               progress: fileProgress)
+            added.append(item.id)
+            sentBefore += sizes[index]
+            transfer.progress.completedUnitCount = sentBefore
         }
+        added.append(contentsOf: createdFolders)
     }
 
     func download(_ targets: [RemoteItem]) {

@@ -15,6 +15,13 @@ struct ItemMenuItems: View {
             Button(role: .destructive) { model.dialog = PendingDialog(kind: .deleteForever(targets)) } label: {
                 Label("Delete forever", systemImage: "trash.slash")
             }
+        } else if targets.contains(where: \.isUploading) {
+            // Not on the server yet: only local actions make sense.
+            if single {
+                Button { model.open(item) } label: { Label("Open", systemImage: "arrow.up.forward.app") }
+                Button { model.showInFinder(item) } label: { Label("Show in Finder", systemImage: "macwindow") }
+            }
+            Text("Still uploading…")
         } else {
             if single && !inHeader {
                 Button { model.open(item) } label: { Label("Open", systemImage: "arrow.up.forward.app") }
@@ -42,7 +49,7 @@ struct ItemMenuItems: View {
             Button { model.setStarred(targets, !starred) } label: {
                 Label(starred ? "Remove from Starred" : "Add to Starred", systemImage: starred ? "star.slash" : "star")
             }
-            let offline = targets.allSatisfy { model.isPinned($0) }
+            let offline = targets.allSatisfy { model.isOffline($0) }
             Button { model.setOffline(targets, on: !offline) } label: {
                 Label(offline ? "Remove offline copy" : "Make available offline",
                       systemImage: offline ? "icloud" : "checkmark.circle")
@@ -93,8 +100,12 @@ struct ItemBadges: View {
                 Image(systemName: "star.fill").font(.system(size: 10)).foregroundStyle(Theme.textSecondary)
                     .help("Starred")
             }
-            if model.section != .trash && model.isOffline(item) {
-                let kept = model.isPinned(item) || !model.downloaded.contains(item.id)
+            if item.isUploading {
+                Image(systemName: "arrow.up.circle")
+                    .font(.system(size: 11)).foregroundStyle(Theme.textSecondary)
+                    .help("Uploading to the server")
+            } else if model.section != .trash && model.isOffline(item) {
+                let kept = model.isKept(item)
                 Image(systemName: kept ? "checkmark.circle.fill" : "checkmark.circle")
                     .font(.system(size: 11)).foregroundStyle(Theme.textSecondary)
                     .help(kept ? "Always kept on this Mac" : "Downloaded to this Mac")

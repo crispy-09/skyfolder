@@ -50,15 +50,15 @@ struct DetailsPanel: View {
                                 detail("Location", item.parentPath.map { $0.isEmpty ? "My Files" : "My Files/" + $0 } ?? "—")
                                 detail("Owner", "me")
                                 if let d = item.modified { detail("Modified", d.formatted(date: .long, time: .shortened)) }
-                                detail("On this Mac", model.isPinned(item) ? "Always kept offline"
+                                detail("On this Mac", model.isKept(item) && model.isOffline(item) ? "Always kept offline"
                                        : model.isOffline(item) ? "Downloaded" : "Online-only (downloads when opened)")
                                 if item.isFavorite { detail("Starred", "Yes") }
                             }
                         }
                         if model.section != .trash && item.id != model.account?.rootID {
                             HStack {
-                                Button(model.isPinned(item) ? "Remove offline copy" : "Make available offline") {
-                                    model.setOffline([item], on: !model.isPinned(item))
+                                Button(model.isOffline(item) ? "Remove offline copy" : "Make available offline") {
+                                    model.setOffline([item], on: !model.isOffline(item))
                                 }
                                 Button("Open in web") { model.openWeb(item) }
                             }
@@ -171,7 +171,9 @@ struct TransfersPanel: View {
                             ForEach(model.transfers) { t in TransferRow(transfer: t) }
                         }
                     }
-                    .frame(maxHeight: 260)
+                    // As tall as its rows, up to five; more than that scrolls.
+                    .frame(height: min(CGFloat(model.transfers.count), 5) * TransferRow.height)
+                    .animation(.easeOut(duration: 0.15), value: model.transfers.count)
                 }
             }
             .frame(width: 360)
@@ -183,24 +185,33 @@ struct TransfersPanel: View {
 }
 
 struct TransferRow: View {
+    static let height: CGFloat = 54
     let transfer: Transfer
     @State private var hovering = false
+    private var isFailed: Bool { if case .failed = transfer.state { return true } else { return false } }
 
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: transfer.isFolder ? "folder.fill" : (transfer.kind == .upload ? "doc" : "arrow.down.doc"))
                 .foregroundStyle(Theme.textSecondary)
                 .frame(width: 20)
-            Text(transfer.name)
-                .font(.system(size: 13))
-                .foregroundStyle(Theme.textPrimary)
-                .lineLimit(1)
-                .truncationMode(.middle)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(transfer.name)
+                    .font(.system(size: 13))
+                    .foregroundStyle(Theme.textPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(transfer.detail)
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundStyle(isFailed ? Theme.danger : Theme.textSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
             Spacer()
             status
         }
         .padding(.horizontal, 18)
-        .frame(height: 46)
+        .frame(height: Self.height)
         .onHover { hovering = $0 }
     }
 
@@ -231,7 +242,7 @@ struct TransferRow: View {
         case .failed(let msg):
             Image(systemName: "exclamationmark.circle.fill").foregroundStyle(Theme.danger).help(msg)
         case .cancelled:
-            Text("Canceled").font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+            Image(systemName: "xmark.circle").foregroundStyle(Theme.textSecondary)
         }
     }
 }

@@ -129,6 +129,7 @@ struct RootView: View {
 struct SettingsView: View {
     @Environment(DriveModel.self) private var model
     @State private var confirmSignOut = false
+    @State private var confirmRemoveOffline = false
 
     var body: some View {
         @Bindable var model = model
@@ -150,6 +151,14 @@ struct SettingsView: View {
                         .font(.callout).foregroundStyle(.secondary)
                     Button("Open in Finder") { model.openInFinder() }.disabled(!model.finderEnabled)
                 }
+                Section("Offline copies") {
+                    LabeledContent("On this Mac", value: model.onDisk.isEmpty && model.pinned.isEmpty ? "Nothing downloaded"
+                                   : "\(model.onDisk.count) downloaded, \(model.pinned.count) kept offline")
+                    Button(model.removingOffline ? "Removing…" : "Remove All Offline Copies…", role: .destructive) {
+                        confirmRemoveOffline = true
+                    }
+                    .disabled(!model.finderEnabled || model.removingOffline || (model.onDisk.isEmpty && model.pinned.isEmpty))
+                }
                 Section {
                     Toggle("Open at login", isOn: $model.openAtLogin)
                     Button("Sign Out…", role: .destructive) { confirmSignOut = true }
@@ -159,7 +168,13 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 480)
+        .frame(width: 480, height: 640)
+        .task { await model.refreshDownloadedNow() }
+        .confirmationDialog("Remove all offline copies from this Mac?", isPresented: $confirmRemoveOffline) {
+            Button("Remove All", role: .destructive) { model.removeAllOfflineCopies() }
+        } message: {
+            Text("Everything goes back to online-only and nothing stays marked “available offline”. Your files stay on the server, and files that are still uploading are not touched.")
+        }
         .confirmationDialog("Sign out of OpenCloud?", isPresented: $confirmSignOut) {
             Button("Sign Out", role: .destructive) { model.signOut() }
         } message: {

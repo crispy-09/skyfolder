@@ -36,11 +36,41 @@ enum PinnedStore {
 
     static func isPinned(_ id: String) -> Bool { all()[id] != nil }
 
+    /// True if the item is pinned itself or sits inside a pinned folder.
+    static func covers(_ id: String, path: String?, in pins: [String: Info]) -> Bool {
+        if pins[id] != nil { return true }
+        guard let p = path else { return false }
+        return pins.values.contains { info in
+            guard info.isFolder, let fp = info.path else { return false }
+            return fp.isEmpty || p.hasPrefix(fp + "/")
+        }
+    }
+
+    /// Earlier builds told the system to keep pinned items downloaded (`keepDownloaded`), which makes macOS refuse
+    /// Finder's "Remove Download". Pins are now enforced by Skyfolder itself, so re-report every pinned item once
+    /// so the system drops the old policy.
+    static func migrateContentPolicyIfNeeded() {
+        let marker = "policy-v2.json"
+        guard SharedFile.read(Bool.self, marker) != true else { return }
+        let ids = Array(all().keys)
+        if !ids.isEmpty { markDirty(ids) }
+        SharedFile.write(true, marker)
+    }
+
     static func set(_ id: String, pinned: Bool, info: Info?) {
         SharedFile.update(pinnedFile, default: [String: Info]()) { dict in
             if pinned, let info { dict[id] = info } else { dict.removeValue(forKey: id) }
         }
         markDirty([id])
+    }
+
+    /// Keeps a pin's stored name and path current after the item was renamed or moved.
+    static func updateLocation(_ id: String, name: String, path: String) {
+        guard let info = all()[id], info.path != path || info.name != name else { return }
+        SharedFile.update(pinnedFile, default: [String: Info]()) { dict in
+            dict[id]?.name = name
+            dict[id]?.path = path
+        }
     }
 
     static func clearAll() {
@@ -73,6 +103,8 @@ enum DownloadedStore {
         var name: String
         var path: String?
         var date: Date
+        /// Server etag of the downloaded version. Lets the app tell "evicted by the user" from "outdated".
+        var etag: String?
     }
 
     private static let file = "downloaded.json"
@@ -81,9 +113,9 @@ enum DownloadedStore {
         SharedFile.read([String: Record].self, file) ?? [:]
     }
 
-    static func record(_ id: String, name: String, path: String?) {
+    static func record(_ id: String, name: String, path: String?, etag: String? = nil) {
         SharedFile.update(file, default: [String: Record]()) { dict in
-            dict[id] = Record(name: name, path: path ?? dict[id]?.path, date: Date())
+            dict[id] = Record(name: name, path: path ?? dict[id]?.path, date: Date(), etag: etag)
         }
     }
 
@@ -92,6 +124,17 @@ enum DownloadedStore {
             guard dict[id] != nil else { return }
             dict[id]?.name = name
             if let path { dict[id]?.path = path }
+        }
+    }
+
+    /// Same as `updatePath` for many items, with a single write.
+    static func updatePaths(_ entries: [(id: String, name: String, path: String?)]) {
+        guard !entries.isEmpty else { return }
+        SharedFile.update(file, default: [String: Record]()) { dict in
+            for e in entries where dict[e.id] != nil {
+                dict[e.id]?.name = e.name
+                if let path = e.path { dict[e.id]?.path = path }
+            }
         }
     }
 

@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 enum DAVError: LocalizedError {
     case http(Int, String?)
@@ -31,6 +32,9 @@ struct Quota {
 final class DAVClient: @unchecked Sendable {
     let account: AccountConfig
     let session: URLSession
+    /// For uploads and downloads. Many transfers sharing a slow link can each sit idle far longer than a metadata
+    /// request ever should, so they get a much longer idle timeout.
+    let transferSession: URLSession
     private let tokens: TokenProvider
 
     init(account: AccountConfig, tokens: TokenProvider = .shared) {
@@ -42,6 +46,12 @@ final class DAVClient: @unchecked Sendable {
         cfg.httpMaximumConnectionsPerHost = 6
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
         self.session = URLSession(configuration: cfg)
+        let tcfg = URLSessionConfiguration.default
+        tcfg.timeoutIntervalForRequest = 60 * 10
+        tcfg.timeoutIntervalForResource = 60 * 60 * 24
+        tcfg.httpMaximumConnectionsPerHost = 6
+        tcfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        self.transferSession = URLSession(configuration: tcfg)
     }
 
     // MARK: URLs
@@ -279,7 +289,7 @@ final class DAVClient: @unchecked Sendable {
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             let http: HTTPURLResponse = try await withCheckedThrowingContinuation { cont in
                 var observation: NSKeyValueObservation?
-                let task = session.downloadTask(with: req) { tmp, resp, error in
+                let task = transferSession.downloadTask(with: req) { tmp, resp, error in
                     observation?.invalidate()
                     if let error { cont.resume(throwing: error); return }
                     guard let http = resp as? HTTPURLResponse else { cont.resume(throwing: DAVError.invalidResponse); return }
@@ -310,7 +320,60 @@ final class DAVClient: @unchecked Sendable {
     /// Uploads (PUT) a local file and returns the resulting item.
     /// - Parameters:
     ///   - target: either `.new(parentID:name:)` or `.existing(id:ifMatch:)`
-    func upload(file: URL, to target: UploadTarget, modified: Date? = nil, progress: Progress? = nil) async throws -> RemoteItem {
+    /// - Parameter existingLocation: for `.existing` targets, the file's current parent and name. Large files go
+    ///   through resumable chunked (TUS) uploads, which address the file by parent + name.
+    func upload(file: URL, to target: UploadTarget, modified: Date? = nil, progress: Progress? = nil,
+                existingLocation: (parentID: String, name: String)? = nil) async throws -> RemoteItem {
+        // A big batch (Finder copies in thousands of files at once) would otherwise open as many uploads as the
+        // system asks for, saturate the uplink and starve listings, sign-in refreshes and everything else.
+        await Self.uploadGate.acquire()
+        defer { Task { await Self.uploadGate.release() } }
+        try Task.checkCancellation()
+        do {
+            return try await uploadNow(file: file, to: target, modified: modified, progress: progress, existingLocation: existingLocation)
+        } catch {
+            // A cancelled upload of a new file leaves an empty file behind on the server. Remove it, so it doesn't
+            // show up as a real (empty) file later. Failures are left alone: those are retried and fill it in.
+            let cancelled = error is CancellationError || (error as? URLError)?.code == .cancelled
+                || progress?.isCancelled == true
+            if cancelled, case .new(let parentID, let name) = target {
+                Task.detached { [self] in await removeEmptyLeftover(parentID: parentID, name: name) }
+            }
+            throw error
+        }
+    }
+
+    /// Deletes `name` in `parentID` if it is an empty file, and clears it out of the server's trash too.
+    private func removeEmptyLeftover(parentID: String, name: String) async {
+        guard let it = try? await child(parentID: parentID, name: name), !it.isFolder, it.size == 0 else { return }
+        try? await delete(id: it.id)
+        try? await purge(trashKey: it.opaqueID)
+    }
+
+    static let uploadGate = TransferGate(limit: 3)
+
+    private func uploadNow(file: URL, to target: UploadTarget, modified: Date?, progress: Progress?,
+                           existingLocation: (parentID: String, name: String)?) async throws -> RemoteItem {
+        let size = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? NSNumber)?.int64Value ?? 0
+        if size > Self.tusThreshold {
+            var tusTarget: (parentID: String, name: String, ifMatch: String?)?
+            switch target {
+            case .new(let parentID, let name): tusTarget = (parentID, name, nil)
+            case .existing(let id, let ifMatch):
+                // Only if the file still has that name; otherwise a TUS "overwrite" would create a duplicate.
+                if let loc = existingLocation, let current = try? await item(id: id), current.name == loc.name,
+                   current.parentID == nil || current.parentID == loc.parentID {
+                    tusTarget = (loc.parentID, loc.name, ifMatch)
+                }
+            }
+            if let t = tusTarget {
+                if let fid = try await tusUpload(file: file, size: size, parentID: t.parentID, name: t.name, ifMatch: t.ifMatch,
+                                                 modified: modified, progress: progress) {
+                    return try await item(id: fid)
+                }
+                // Server doesn't offer resumable uploads; fall through to a single PUT.
+            }
+        }
         let url: URL
         var headers: [String: String] = ["Content-Type": "application/octet-stream"]
         switch target {
@@ -321,7 +384,6 @@ final class DAVClient: @unchecked Sendable {
             if let ifMatch, !ifMatch.isEmpty { headers["If-Match"] = "\"\(ifMatch)\"" }
         }
         if let modified { headers["X-OC-Mtime"] = String(Int64(modified.timeIntervalSince1970)) }
-        let size = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? NSNumber)?.int64Value ?? 0
         headers["OC-Total-Length"] = String(size)
 
         var rejected: String?
@@ -332,7 +394,7 @@ final class DAVClient: @unchecked Sendable {
             for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             let delegate = TransferDelegate(progress: progress)
-            let (data, resp) = try await session.upload(for: req, fromFile: file, delegate: delegate)
+            let (data, resp) = try await transferSession.upload(for: req, fromFile: file, delegate: delegate)
             guard let http = resp as? HTTPURLResponse else { throw DAVError.invalidResponse }
             if http.statusCode == 401 && attempt == 0 { rejected = token; continue }
             try Self.check(http, data: data, expect: nil)
@@ -345,6 +407,149 @@ final class DAVClient: @unchecked Sendable {
             }
         }
         throw DAVError.unauthorized
+    }
+
+    // MARK: Chunked (TUS) uploads
+
+    /// Files above this size are uploaded in chunks. A single huge PUT trips proxy limits (e.g. Cloudflare's 100 MB
+    /// request cap and ~100 s response timeout) and can't resume after a dropped connection.
+    static let tusThreshold: Int64 = 20_000_000
+    /// Must stay at or below the server's advertised `max_chunk_size` (10 MB on OpenCloud).
+    static let tusChunkSize = 8_000_000
+
+    private static func b64(_ s: String) -> String { Data(s.utf8).base64EncodedString() }
+
+    /// Uploads `file` with the TUS protocol. Returns the new file's id, or nil when the server doesn't support TUS
+    /// (the caller then falls back to PUT). Network hiccups are retried and resumed from the server's offset.
+    private func tusUpload(file: URL, size: Int64, parentID: String, name: String, ifMatch: String?,
+                           modified: Date?, progress: Progress?) async throws -> String? {
+        var meta = ["filename \(Self.b64(name))"]
+        if let modified { meta.append("mtime \(Self.b64(String(Int64(modified.timeIntervalSince1970))))") }
+        var headers = ["Tus-Resumable": "1.0.0", "Upload-Length": String(size), "Upload-Metadata": meta.joined(separator: ",")]
+        if let ifMatch, !ifMatch.isEmpty { headers["If-Match"] = "\"\(ifMatch)\"" }
+
+        let created: HTTPURLResponse
+        do {
+            (_, created) = try await send("POST", davURL(resource: parentID), headers: headers, expect: [201])
+        } catch DAVError.http(let code, _) where [400, 404, 405, 501].contains(code) {
+            return nil
+        } catch DAVError.notFound {
+            return nil
+        }
+        guard let loc = created.value(forHTTPHeaderField: "Location"), let uploadURL = URL(string: loc, relativeTo: davURL(resource: parentID))?.absoluteURL
+        else { return nil }
+
+        progress?.totalUnitCount = size
+        let handle = try FileHandle(forReadingFrom: file)
+        defer { try? handle.close() }
+        var offset: Int64 = 0
+        var fileID: String?
+        var failures = 0
+        /// After a failed chunk: resume from the server's offset. If the upload session is gone and the file is
+        /// there at full size, the last chunk did land and only its response was lost.
+        func recover(lastChunk: Bool) async -> String? {
+            do {
+                offset = try await tusOffset(uploadURL)
+            } catch DAVError.notFound where lastChunk {
+                if let done = try? await stat(childURL(parentID: parentID, name: name)), done.size == size { return done.id }
+            } catch DAVError.http(410, _) where lastChunk {
+                if let done = try? await stat(childURL(parentID: parentID, name: name)), done.size == size { return done.id }
+            } catch {}
+            return nil
+        }
+        while offset < size {
+            try Task.checkCancellation()
+            if progress?.isCancelled == true { throw CancellationError() }
+            try handle.seek(toOffset: UInt64(offset))
+            let want = Int(min(Int64(Self.tusChunkSize), size - offset))
+            guard let chunk = try handle.read(upToCount: want), chunk.count == want else {
+                throw DAVError.http(0, "The file changed while it was being uploaded.")
+            }
+            do {
+                let http = try await tusPatch(uploadURL, chunk: chunk, offset: offset, base: offset, total: size, progress: progress)
+                offset += Int64(chunk.count)
+                failures = 0
+                if let fid = http.value(forHTTPHeaderField: "OC-FileId"), !fid.isEmpty { fileID = fid }
+            } catch let error as URLError where error.code != .cancelled {
+                failures += 1
+                if failures > 6 { throw error }
+                try await Task.sleep(nanoseconds: UInt64(min(failures, 5)) * 2_000_000_000)
+                // The chunk may or may not have landed: ask the server where we are.
+                if let done = await recover(lastChunk: offset + Int64(want) >= size) { return done }
+            } catch DAVError.http(let code, _) where (500...599).contains(code) && failures < 6 {
+                failures += 1
+                try await Task.sleep(nanoseconds: UInt64(min(failures, 5)) * 2_000_000_000)
+                if let done = await recover(lastChunk: offset + Int64(want) >= size) { return done }
+            }
+        }
+        if let fileID { return fileID }
+        // Zero-length edge or missing header: look the file up by name.
+        return try await stat(childURL(parentID: parentID, name: name)).id
+    }
+
+    private func tusOffset(_ url: URL) async throws -> Int64 {
+        let (_, http) = try await send("HEAD", url, headers: ["Tus-Resumable": "1.0.0"])
+        guard let v = http.value(forHTTPHeaderField: "Upload-Offset"), let n = Int64(v) else { throw DAVError.invalidResponse }
+        return n
+    }
+
+    private func tusPatch(_ url: URL, chunk: Data, offset: Int64, base: Int64, total: Int64, progress: Progress?) async throws -> HTTPURLResponse {
+        var rejected: String?
+        for attempt in 0..<2 {
+            let token = try await tokens.accessToken(rejected: rejected)
+            var req = URLRequest(url: url)
+            req.httpMethod = "PATCH"
+            req.setValue("1.0.0", forHTTPHeaderField: "Tus-Resumable")
+            req.setValue(String(offset), forHTTPHeaderField: "Upload-Offset")
+            req.setValue("application/offset+octet-stream", forHTTPHeaderField: "Content-Type")
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            let delegate = TransferDelegate(progress: progress, base: base, total: total)
+            let (data, resp) = try await transferSession.upload(for: req, from: chunk, delegate: delegate)
+            guard let http = resp as? HTTPURLResponse else { throw DAVError.invalidResponse }
+            if http.statusCode == 401 && attempt == 0 { rejected = token; continue }
+            try Self.check(http, data: data, expect: nil)
+            return http
+        }
+        throw DAVError.unauthorized
+    }
+
+    /// The server's SHA-1 of a file's contents (lowercase hex), if it reports one.
+    func sha1(id: String) async -> String? {
+        let body = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"><d:prop><oc:checksums/></d:prop></d:propfind>
+        """
+        guard let (data, _) = try? await send("PROPFIND", idURL(id), headers: ["Depth": "0", "Content-Type": "application/xml"],
+                                              body: body.data(using: .utf8)),
+              let text = String(data: data, encoding: .utf8),
+              let r = text.range(of: "SHA1:") else { return nil }
+        let hex = text[r.upperBound...].prefix { $0.isHexDigit }
+        return hex.count == 40 ? hex.lowercased() : nil
+    }
+
+    /// SHA-1 of a local file, read in pieces so large files don't have to fit in memory.
+    static func sha1(of file: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
+        defer { try? handle.close() }
+        var hasher = Insecure.SHA1()
+        while let chunk = try? handle.read(upToCount: 1 << 20), !chunk.isEmpty { hasher.update(data: chunk) }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Every file below a folder (capped so a huge tree can't run forever). Paths are filled in from `path`.
+    func files(under folderID: String, path: String?) async -> [RemoteItem] {
+        var out: [RemoteItem] = []
+        var stack: [(id: String, path: String?)] = [(folderID, path)]
+        var visited = 0
+        while let next = stack.popLast(), visited < 2_000, out.count < 20_000 {
+            visited += 1
+            guard let (_, kids) = try? await listFolder(id: next.id) else { continue }
+            for var k in kids {
+                if k.path == nil, let base = next.path { k.path = base.isEmpty ? k.name : base + "/" + k.name }
+                if k.isFolder { stack.append((k.id, k.path)) } else { out.append(k) }
+            }
+        }
+        return out
     }
 
     enum UploadTarget {
@@ -481,19 +686,44 @@ final class DAVClient: @unchecked Sendable {
     }
 }
 
-/// Bridges URLSession per-task upload callbacks to a Progress.
+/// Bridges URLSession per-task upload callbacks to a Progress. For chunked uploads, `base` is the number of
+/// bytes already sent in earlier chunks and `total` the whole file's size.
 final class TransferDelegate: NSObject, URLSessionTaskDelegate {
     let progress: Progress?
-    init(progress: Progress?) { self.progress = progress }
+    let base: Int64
+    let total: Int64?
+    init(progress: Progress?, base: Int64 = 0, total: Int64? = nil) {
+        self.progress = progress
+        self.base = base
+        self.total = total
+    }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64,
                     totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
         guard let progress else { return }
-        if totalBytesExpectedToSend > 0 { progress.totalUnitCount = totalBytesExpectedToSend }
-        progress.completedUnitCount = totalBytesSent
+        if let total { progress.totalUnitCount = total }
+        else if totalBytesExpectedToSend > 0 { progress.totalUnitCount = totalBytesExpectedToSend }
+        progress.completedUnitCount = base + totalBytesSent
     }
 
     func urlSession(_ session: URLSession, didCreateTask task: URLSessionTask) {
         progress?.cancellationHandler = { [weak task] in task?.cancel() }
+    }
+}
+
+/// Lets only a few transfers run at once; the rest wait their turn in order.
+actor TransferGate {
+    private var available: Int
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(limit: Int) { available = limit }
+
+    func acquire() async {
+        if available > 0 { available -= 1; return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        if waiters.isEmpty { available += 1 } else { waiters.removeFirst().resume() }
     }
 }

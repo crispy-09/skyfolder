@@ -25,7 +25,34 @@ final class ItemCache {
         }
     }
 
+    /// While a change scan runs, nothing is written to disk: the scan's findings only count once they have been
+    /// handed to the system. If the scan fails, or the process dies first, the saved state is still the old one
+    /// and the next scan finds the same differences again.
+    private var scanning = false
+
+    /// Starts a scan and returns a copy of the current state to roll back to.
+    func beginScan() -> Data? {
+        lock.withLock {
+            scanning = true
+            return try? JSONEncoder().encode(state)
+        }
+    }
+
+    /// The scan's results were delivered: save.
+    func commitScan() {
+        lock.withLock { scanning = false; persist() }
+    }
+
+    /// The scan failed: forget what it changed.
+    func abortScan(_ snapshot: Data?) {
+        lock.withLock {
+            scanning = false
+            if let snapshot, let s = try? JSONDecoder().decode(State.self, from: snapshot) { state = s }
+        }
+    }
+
     private func persist() {
+        if scanning { return }
         if let data = try? JSONEncoder().encode(state) { try? data.write(to: url, options: .atomic) }
     }
 
@@ -65,7 +92,31 @@ final class ItemCache {
             for key in state.folders.keys where key != parentID {
                 state.folders[key]?.children.removeValue(forKey: item.id)
             }
+            // The parent may be a folder created on this Mac that the system never asked us to enumerate.
+            // Track it anyway (empty etag = "rescan me"), otherwise remote changes inside it go unnoticed.
+            if state.folders[parentID] == nil { state.folders[parentID] = Folder(etag: "", children: [:]) }
             state.folders[parentID]?.children[item.id] = item
+            if item.isFolder, state.folders[item.id] == nil { state.folders[item.id] = Folder(etag: "", children: [:]) }
+            persist()
+        }
+    }
+
+    /// Starts tracking folders that exist on disk but were never enumerated through us (created on this Mac).
+    /// - Parameter fullRescan: also forget every stored listing, so the next scan reports all items again. The
+    ///   system ignores what it already has; this recovers changes an earlier build detected but never delivered.
+    func registerFolders(_ ids: [String], fullRescan: Bool) {
+        lock.withLock {
+            var changed = false
+            for id in ids where state.folders[id] == nil {
+                state.folders[id] = Folder(etag: "", children: [:])
+                changed = true
+            }
+            guard changed || fullRescan else { return }
+            // Forget folder etags so the next scan walks the whole known tree and reaches the new entries.
+            for key in state.folders.keys {
+                state.folders[key]?.etag = ""
+                if fullRescan { state.folders[key]?.children = [:] }
+            }
             persist()
         }
     }

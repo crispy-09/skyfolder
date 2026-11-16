@@ -338,7 +338,7 @@ struct SelectionBar: View {
                 barButton(allStarred ? "star.slash" : "star", allStarred ? "Remove from Starred" : "Add to Starred") {
                     model.setStarred(sel, !allStarred)
                 }
-                let allOffline = sel.allSatisfy { model.isPinned($0) }
+                let allOffline = sel.allSatisfy { model.isOffline($0) }
                 barButton(allOffline ? "icloud" : "checkmark.circle",
                           allOffline ? "Remove offline copy" : "Make available offline") {
                     model.setOffline(sel, on: !allOffline)

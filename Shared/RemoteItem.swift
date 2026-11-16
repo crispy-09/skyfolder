@@ -22,6 +22,17 @@ struct RemoteItem: Codable, Hashable, Identifiable {
     var originalLocation: String?
     var deletedAt: Date?
 
+    /// True for a file that exists only on this Mac so far (still being uploaded through Finder).
+    /// Such entries are made up by the app from the Finder folder; the server doesn't know them yet.
+    var isUploading: Bool { id.hasPrefix(Self.localPrefix) }
+    static let localPrefix = "local:"
+
+    static func uploading(path: String, size: Int64, modified: Date?) -> RemoteItem {
+        RemoteItem(id: localPrefix + path, parentID: nil, name: (path as NSString).lastPathComponent, path: path,
+                   isFolder: false, size: size, modified: modified, etag: "", contentType: nil, permissions: "R",
+                   tags: [], privateLink: nil, hasPreview: false)
+    }
+
     var isFavorite: Bool { tags.contains(AppConstants.favoriteTag) }
 
     /// Opaque node id (the part after "!"); also the trash-bin key once the item is deleted.

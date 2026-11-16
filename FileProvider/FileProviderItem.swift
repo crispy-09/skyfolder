@@ -36,7 +36,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
 
     var itemVersion: NSFileProviderItemVersion {
         let content = remote.isFolder ? "folder" : remote.etag
-        let meta = [remote.etag, remote.name, remote.parentID ?? "", pinned ? "p" : "", remote.tags.joined(separator: ",")]
+        let meta = [remote.etag, remote.name, remote.parentID ?? "", pinned ? "p2" : "", remote.tags.joined(separator: ",")]
             .joined(separator: "|")
         return NSFileProviderItemVersion(contentVersion: Data(content.utf8), metadataVersion: Data(meta.utf8))
     }
@@ -64,10 +64,10 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
         return flags
     }
 
-    /// Default is on-demand ("online-only"); pinned items (and everything under pinned folders) stay downloaded.
+    /// Always on-demand. Pinned items are downloaded by Skyfolder (see `FileProviderExtension.requestDownloads`) rather
+    /// than via `keepDownloaded`, because macOS refuses to evict such items ("... cannot be evicted").
     var contentPolicy: NSFileProviderContentPolicy {
-        if pinned { return .downloadEagerlyAndKeepDownloaded }
-        return isRoot ? .downloadLazily : .inherited
+        isRoot ? .downloadLazily : .inherited
     }
 
     var userInfo: [AnyHashable: Any]? { ["pinned": pinned] }
