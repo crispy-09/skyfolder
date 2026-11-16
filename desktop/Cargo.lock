@@ -3940,6 +3940,7 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bytes",
  "directories",
  "futures-util",
  "httpdate",

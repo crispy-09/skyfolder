@@ -51,8 +51,16 @@ pub struct Quota {
 
 pub enum UploadTarget<'a> {
     New { parent_id: &'a str, name: &'a str },
-    Existing { id: &'a str, if_match: Option<&'a str> },
+    /// `at` is the file's current (parent id, name). Large files are uploaded in resumable chunks (TUS), which
+    /// address the file by parent and name; without it an overwrite falls back to a single PUT.
+    Existing { id: &'a str, if_match: Option<&'a str>, at: Option<(&'a str, &'a str)> },
 }
+
+/// Files above this size are uploaded in chunks: one huge PUT trips proxy limits (Cloudflare caps request bodies at
+/// 100 MB and responses at ~100 s) and cannot resume after a dropped connection.
+const TUS_THRESHOLD: u64 = 20_000_000;
+/// Must stay at or below the server's advertised `max_chunk_size` (10 MB on OpenCloud).
+const TUS_CHUNK: u64 = 8_000_000;
 
 /// Progress callback: (bytes done, bytes total).
 pub type ProgressFn<'a> = &'a (dyn Fn(u64, u64) + Send + Sync);
@@ -77,6 +85,9 @@ const TRASH_PROPFIND: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 pub struct DavClient {
     pub account: Account,
     http: reqwest::Client,
+    /// For request bodies that take long to send. reqwest's `read_timeout` runs from the start of a request until
+    /// the response arrives, so on the normal client an upload slower than 120 s would always time out.
+    http_upload: reqwest::Client,
     tokens: Arc<TokenProvider>,
 }
 
@@ -89,7 +100,13 @@ impl DavClient {
             .user_agent(concat!("Skyfolder/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("http client");
-        Self { account, http, tokens }
+        let http_upload = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(20))
+            .pool_max_idle_per_host(8)
+            .user_agent(concat!("Skyfolder/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .expect("http client");
+        Self { account, http, http_upload, tokens }
     }
 
     // ---------- URLs ----------
@@ -374,9 +391,28 @@ impl DavClient {
     pub async fn upload(&self, file: &Path, target: UploadTarget<'_>, mtime: Option<i64>, progress: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>) -> Result<RemoteItem> {
         let (url, if_match) = match &target {
             UploadTarget::New { parent_id, name } => (self.child_url(parent_id, name), None),
-            UploadTarget::Existing { id, if_match } => (self.id_url(id), if_match.map(|s| s.to_string())),
+            UploadTarget::Existing { id, if_match, .. } => (self.id_url(id), if_match.map(|s| s.to_string())),
         };
         let size = tokio::fs::metadata(file).await?.len();
+        if size > TUS_THRESHOLD {
+            let tus_target = match &target {
+                UploadTarget::New { parent_id, name } => Some((*parent_id, *name, None)),
+                UploadTarget::Existing { id, if_match, at: Some((parent, name)) } => {
+                    // Only if the file still has that name; otherwise a TUS "overwrite" would create a duplicate.
+                    match self.item_by_id(id).await {
+                        Ok(cur) if cur.name == *name && cur.parent_id.as_deref().is_none_or(|p| p == *parent) => Some((*parent, *name, *if_match)),
+                        _ => None,
+                    }
+                }
+                UploadTarget::Existing { .. } => None,
+            };
+            if let Some((parent, name, im)) = tus_target {
+                if let Some(fid) = self.tus_upload(file, size, parent, name, im, mtime, progress.as_ref()).await? {
+                    return self.item_by_id(&fid).await;
+                }
+                // The server has no resumable uploads: fall through to a plain PUT.
+            }
+        }
         let mut rejected: Option<String> = None;
         for attempt in 0..2 {
             let token = self.tokens.access_token(rejected.as_deref()).await?;
@@ -391,7 +427,7 @@ impl DavClient {
                 chunk
             });
             let mut req = self
-                .http
+                .http_upload
                 .put(&url)
                 .bearer_auth(&token)
                 .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -420,6 +456,118 @@ impl DavClient {
                 UploadTarget::New { parent_id, name } => self.stat(&self.child_url(parent_id, name)).await,
                 UploadTarget::Existing { id, .. } => self.item_by_id(id).await,
             };
+        }
+        Err(AuthError::SessionExpired.into())
+    }
+
+    /// Uploads with the TUS protocol in `TUS_CHUNK` pieces, retrying and resuming from the server's offset after
+    /// network errors. Returns the file id, or None if the server doesn't support TUS.
+    #[allow(clippy::too_many_arguments)]
+    async fn tus_upload(&self, file: &Path, size: u64, parent_id: &str, name: &str, if_match: Option<&str>, mtime: Option<i64>, progress: Option<&Arc<dyn Fn(u64, u64) + Send + Sync>>) -> Result<Option<String>> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut meta = format!("filename {}", STANDARD.encode(name));
+        if let Some(m) = mtime {
+            meta.push_str(&format!(",mtime {}", STANDARD.encode(m.to_string())));
+        }
+        let parent_url = self.id_url(parent_id);
+        let mut hdrs = vec![("Tus-Resumable", "1.0.0".to_string()), ("Upload-Length", size.to_string()), ("Upload-Metadata", meta)];
+        if let Some(m) = if_match.filter(|m| !m.is_empty()) {
+            hdrs.push(("If-Match", format!("\"{m}\"")));
+        }
+        let created = match self.send(Method::POST, &parent_url, &hdrs, None, &[]).await {
+            Ok((_, h, _)) => h,
+            Err(DavError::Http(400 | 405 | 501, _)) | Err(DavError::NotFound) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let Some(loc) = created.get(header::LOCATION).and_then(|v| v.to_str().ok()) else { return Ok(None) };
+        let upload_url = url::Url::parse(&parent_url).ok().and_then(|b| b.join(loc).ok()).map(|u| u.to_string()).unwrap_or_else(|| loc.to_string());
+
+        let mut f = tokio::fs::File::open(file).await?;
+        let mut offset = 0u64;
+        let mut file_id: Option<String> = None;
+        let mut failures = 0u32;
+        while offset < size {
+            let want = TUS_CHUNK.min(size - offset) as usize;
+            f.seek(std::io::SeekFrom::Start(offset)).await?;
+            let mut buf = vec![0u8; want];
+            f.read_exact(&mut buf).await.map_err(|_| DavError::Http(0, Some("The file changed while it was being uploaded.".into())))?;
+            match self.tus_patch(&upload_url, buf, offset, size, progress).await {
+                Ok(h) => {
+                    offset += want as u64;
+                    failures = 0;
+                    if let Some(fid) = h.get("oc-fileid").and_then(|v| v.to_str().ok()).filter(|s| !s.is_empty()) {
+                        file_id = Some(fid.to_string());
+                    }
+                }
+                Err(e) if failures < 6 && (matches!(e, DavError::Network(_)) || matches!(e, DavError::Http(500..=599, _))) => {
+                    failures += 1;
+                    tracing::warn!("chunk at {offset} failed ({e}); retrying");
+                    tokio::time::sleep(Duration::from_secs(failures.min(5) as u64 * 2)).await;
+                    // The chunk may or may not have landed: ask the server where we are.
+                    match self.send(Method::HEAD, &upload_url, &[("Tus-Resumable", "1.0.0".to_string())], None, &[]).await {
+                        Ok((_, h, _)) => {
+                            if let Some(n) = h.get("upload-offset").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()) {
+                                offset = n;
+                            }
+                        }
+                        // The upload session is gone. If that was the last chunk and the file is there at full
+                        // size, the chunk did land and only its response was lost.
+                        Err(DavError::NotFound) | Err(DavError::Http(410, _)) if offset + want as u64 >= size => {
+                            if let Ok(done) = self.stat(&self.child_url(parent_id, name)).await {
+                                if done.size == size {
+                                    return Ok(Some(done.id));
+                                }
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        match file_id {
+            Some(id) => Ok(Some(id)),
+            None => Ok(Some(self.stat(&self.child_url(parent_id, name)).await?.id)),
+        }
+    }
+
+    async fn tus_patch(&self, url: &str, chunk: Vec<u8>, offset: u64, total: u64, progress: Option<&Arc<dyn Fn(u64, u64) + Send + Sync>>) -> Result<header::HeaderMap> {
+        let mut rejected: Option<String> = None;
+        for attempt in 0..2 {
+            let token = self.tokens.access_token(rejected.as_deref()).await?;
+            let len = chunk.len() as u64;
+            // Report progress as the body is consumed, in 256 KiB steps.
+            let p = progress.cloned();
+            let data = bytes_body_chunks(chunk.clone());
+            let mut sent = 0u64;
+            let stream = futures_util::StreamExt::map(futures_util::stream::iter(data.into_iter().map(Ok::<_, std::io::Error>)), move |c| {
+                if let (Ok(c), Some(p)) = (&c, &p) {
+                    sent += c.len() as u64;
+                    p(offset + sent.min(len), total);
+                }
+                c
+            });
+            let resp = self
+                .http_upload
+                .patch(url)
+                .bearer_auth(&token)
+                .header("Tus-Resumable", "1.0.0")
+                .header("Upload-Offset", offset.to_string())
+                .header(header::CONTENT_TYPE, "application/offset+octet-stream")
+                .header(header::CONTENT_LENGTH, len)
+                .body(reqwest::Body::wrap_stream(stream))
+                .send()
+                .await?;
+            let status = resp.status();
+            if status == StatusCode::UNAUTHORIZED && attempt == 0 {
+                rejected = Some(token);
+                continue;
+            }
+            let hdrs = resp.headers().clone();
+            let b = resp.bytes().await?;
+            check(status, &b, &[])?;
+            return Ok(hdrs);
         }
         Err(AuthError::SessionExpired.into())
     }
@@ -579,6 +727,11 @@ impl DavClient {
 
 mod bytes_body {
     pub struct Body(pub Vec<u8>);
+}
+
+/// Splits a buffer into 256 KiB pieces so progress can be reported while it is sent.
+fn bytes_body_chunks(buf: Vec<u8>) -> Vec<bytes::Bytes> {
+    buf.chunks(256 * 1024).map(bytes::Bytes::copy_from_slice).collect()
 }
 
 fn check(status: StatusCode, body: &[u8], ok_extra: &[u16]) -> Result<()> {

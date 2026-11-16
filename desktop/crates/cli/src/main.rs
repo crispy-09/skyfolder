@@ -66,11 +66,33 @@ async fn selftest() -> Result<()> {
     std::fs::write(&local, "changed!")?;
     t(
         "if-match conflict",
-        matches!(c.upload(&local, UploadTarget::Existing { id: &up.id, if_match: Some("bogus") }, None, None).await, Err(DavError::PreconditionFailed)),
+        matches!(c.upload(&local, UploadTarget::Existing { id: &up.id, if_match: Some("bogus"), at: None }, None, None).await, Err(DavError::PreconditionFailed)),
         String::new(),
     );
-    let up2 = c.upload(&local, UploadTarget::Existing { id: &up.id, if_match: Some(&up.etag) }, None, None).await?;
+    let up2 = c.upload(&local, UploadTarget::Existing { id: &up.id, if_match: Some(&up.etag), at: None }, None, None).await?;
     t("overwrite with etag", up2.size == 8 && up2.id == up.id, String::new());
+    if std::env::var("SKYFOLDER_BIG").is_ok() {
+        // Chunked (TUS) upload path: > 20 MB, so 4 chunks, then an in-place overwrite and a stale If-Match.
+        let big = dir.join("big.bin");
+        let data: Vec<u8> = (0..30_000_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        std::fs::write(&big, &data)?;
+        let t0 = std::time::Instant::now();
+        let b1 = c.upload(&big, UploadTarget::New { parent_id: &f.id, name: "big.bin" }, Some(1_700_000_000), None).await?;
+        t("tus upload", b1.size == data.len() as u64 && b1.modified == Some(1_700_000_000), format!("{:?}", t0.elapsed()));
+        let bd = dir.join("big.dl");
+        c.download(&b1.id, &bd, None).await?;
+        t("tus content intact", std::fs::read(&bd)? == data, String::new());
+        let mut data2 = data.clone();
+        data2.truncate(25_000_000);
+        std::fs::write(&big, &data2)?;
+        t(
+            "tus stale if-match",
+            matches!(c.upload(&big, UploadTarget::Existing { id: &b1.id, if_match: Some("bogus"), at: Some((&f.id, "big.bin")) }, None, None).await, Err(DavError::PreconditionFailed)),
+            String::new(),
+        );
+        let b2 = c.upload(&big, UploadTarget::Existing { id: &b1.id, if_match: Some(&b1.etag), at: Some((&f.id, "big.bin")) }, None, None).await?;
+        t("tus overwrite", b2.id == b1.id && b2.size == 25_000_000, format!("size={}", b2.size));
+    }
     let dl = dir.join("dl.txt");
     c.download(&up.id, &dl, None).await?;
     t("download", std::fs::read_to_string(&dl)? == "changed!", String::new());

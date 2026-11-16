@@ -35,6 +35,9 @@ struct Node {
     local_only: bool,
     open_count: u32,
     dirty: bool,
+    /// Bumped on every local change, so an upload can tell whether the file changed while it was being sent.
+    gen: u64,
+    uploading: bool,
 }
 
 struct OpenFile {
@@ -130,7 +133,7 @@ pub fn mount(client: Arc<DavClient>, dir: &Path) -> anyhow::Result<MountHandle> 
     let mut nodes = HashMap::new();
     nodes.insert(
         ROOT_INO,
-        Node { id: root_id.clone(), parent: ROOT_INO, name: String::new(), item: root_item, children: None, local_only: false, open_count: 0, dirty: false },
+        Node { id: root_id.clone(), parent: ROOT_INO, name: String::new(), item: root_item, children: None, local_only: false, open_count: 0, dirty: false, gen: 0, uploading: false },
     );
     let mut by_id = HashMap::new();
     by_id.insert(root_id, ROOT_INO);
@@ -163,6 +166,7 @@ pub fn mount(client: Arc<DavClient>, dir: &Path) -> anyhow::Result<MountHandle> 
                 if let Ok(q) = e.client.quota().await {
                     e.inner.lock().quota = Some((q.used, q.total));
                 }
+                e.retry_uploads().await;
                 e.sync_pinned().await;
                 e.trim_cache();
                 for _ in 0..60 {
@@ -246,7 +250,7 @@ impl Engine {
         let ino = inner.next_ino;
         inner.next_ino += 1;
         inner.by_id.insert(item.id.clone(), ino);
-        inner.nodes.insert(ino, Node { id: item.id.clone(), parent, name: item.name.clone(), item, children: None, local_only: false, open_count: 0, dirty: false });
+        inner.nodes.insert(ino, Node { id: item.id.clone(), parent, name: item.name.clone(), item, children: None, local_only: false, open_count: 0, dirty: false, gen: 0, uploading: false });
         ino
     }
 
@@ -333,8 +337,51 @@ impl Engine {
         Ok(cp)
     }
 
-    /// Uploads a dirty file once no handles remain open.
+    /// Uploads a dirty file once no handles remain open. Only one upload runs per file; if the file is written
+    /// again while it is being sent, it stays dirty and is uploaded once more afterwards.
     async fn upload_node(self: &Arc<Self>, ino: u64) {
+        loop {
+            let gen = {
+                let mut inner = self.inner.lock();
+                let Some(n) = inner.nodes.get_mut(&ino) else { return };
+                if n.uploading || !n.dirty || n.open_count > 0 {
+                    return;
+                }
+                n.uploading = true;
+                n.gen
+            };
+            self.upload_node_once(ino).await;
+            let again = {
+                let mut inner = self.inner.lock();
+                match inner.nodes.get_mut(&ino) {
+                    Some(n) => {
+                        n.uploading = false;
+                        if n.gen != gen {
+                            n.dirty = true;
+                        }
+                        n.gen != gen && n.open_count == 0
+                    }
+                    None => false,
+                }
+            };
+            if !again {
+                return;
+            }
+        }
+    }
+
+    /// Retries uploads that failed earlier (e.g. the network was down when the file was closed).
+    async fn retry_uploads(self: &Arc<Self>) {
+        let pending: Vec<u64> = {
+            let inner = self.inner.lock();
+            inner.nodes.iter().filter(|(_, n)| n.dirty && n.open_count == 0 && !n.uploading && !is_excluded_name(&n.name)).map(|(i, _)| *i).collect()
+        };
+        for ino in pending {
+            self.upload_node(ino).await;
+        }
+    }
+
+    async fn upload_node_once(self: &Arc<Self>, ino: u64) {
         let (id, parent, name, local_only, base_etag, mtime) = {
             let inner = self.inner.lock();
             let Some(n) = inner.nodes.get(&ino) else { return };
@@ -353,7 +400,7 @@ impl Engine {
                 Err(e) => Err(e),
             }
         } else {
-            match self.client.upload(&cp, UploadTarget::Existing { id: &id, if_match: base_etag.as_deref() }, mtime, None).await {
+            match self.client.upload(&cp, UploadTarget::Existing { id: &id, if_match: base_etag.as_deref(), at: (!parent.is_empty()).then_some((parent.as_str(), name.as_str())) }, mtime, None).await {
                 Err(DavError::PreconditionFailed) => {
                     // Changed here and on the server: keep both.
                     let cname = skyfolder_core::conflict_name(&name);
@@ -635,6 +682,7 @@ impl Filesystem for Fs {
                     if let Some(n) = inner.nodes.get_mut(&ino) {
                         n.item.size = sz;
                         n.dirty = true;
+                        n.gen += 1;
                     }
                     Ok(())
                 }
@@ -707,6 +755,7 @@ impl Filesystem for Fs {
                     if let Some(n) = inner.nodes.get_mut(&ino) {
                         n.item.size = 0;
                         n.dirty = true;
+                        n.gen += 1;
                     }
                     cp
                 } else {
@@ -750,6 +799,7 @@ impl Filesystem for Fs {
                 let len = f.file.metadata().map(|m| m.len()).unwrap_or(0);
                 if let Some(n) = inner.nodes.get_mut(&ino) {
                     n.dirty = true;
+                    n.gen += 1;
                     n.item.size = len;
                     n.item.modified = Some(now_secs() as i64);
                 }
@@ -820,7 +870,7 @@ impl Filesystem for Fs {
         let ino = inner.next_ino;
         inner.next_ino += 1;
         inner.by_id.insert(local_id.clone(), ino);
-        inner.nodes.insert(ino, Node { id: local_id, parent, name, item, children: None, local_only: true, open_count: 1, dirty: true });
+        inner.nodes.insert(ino, Node { id: local_id, parent, name, item, children: None, local_only: true, open_count: 1, dirty: true, gen: 0, uploading: false });
         if let Some(p) = inner.nodes.get_mut(&parent) {
             match &mut p.children {
                 Some((kids, _)) => kids.push(ino),
@@ -972,6 +1022,7 @@ impl Engine {
                     let len = std::fs::metadata(&dst_cp).map(|m| m.len()).unwrap_or(0);
                     if let Some(n) = inner.nodes.get_mut(&dst_ino) {
                         n.dirty = true;
+                        n.gen += 1;
                         n.item.size = len;
                         n.item.modified = Some(now_secs() as i64);
                     }
@@ -1032,6 +1083,7 @@ impl Engine {
         if needs_upload {
             if let Some(n) = self.inner.lock().nodes.get_mut(&src_ino) {
                 n.dirty = true;
+                n.gen += 1;
             }
             self.upload_node(src_ino).await;
         }

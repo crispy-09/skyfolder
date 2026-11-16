@@ -410,7 +410,7 @@ impl Shared {
                         Err(e) => {
                             *tries += 1;
                             tracing::warn!("{w:?} failed ({tries}x): {e:#}");
-                            if *tries >= 8 || !retryable(&e) {
+                            if !retryable(&e) || (*tries >= 8 && !offline(&e)) {
                                 changes.pop_front();
                             } else {
                                 change_retry_at = Instant::now() + backoff(*tries);
@@ -439,7 +439,7 @@ impl Shared {
                     Err(e) => {
                         let tries = tries + 1;
                         tracing::warn!("sync {} failed ({tries}x): {e:#}", p.display());
-                        if tries >= 8 || !retryable(&e) {
+                        if !retryable(&e) || (tries >= 8 && !offline(&e)) {
                             pending.remove(&p);
                         } else {
                             pending.insert(p, (Instant::now() + backoff(tries), tries));
@@ -607,7 +607,7 @@ impl Shared {
         // Pick the target, then upload.
         let mut final_name = name.to_string();
         let result = if let Some(b) = &blob {
-            match self.block(self.client.upload(path, UploadTarget::Existing { id: &b.id, if_match: Some(&b.etag) }, mtime, None)) {
+            match self.block(self.client.upload(path, UploadTarget::Existing { id: &b.id, if_match: Some(&b.etag), at: Some((parent_id.as_str(), name)) }, mtime, None)) {
                 Err(DavError::PreconditionFailed) => {
                     // Changed here and on the server: keep both.
                     final_name = skyfolder_core::conflict_name(name);
@@ -624,8 +624,12 @@ impl Shared {
             }
         } else if let Some(id) = &safe_save {
             // Replacement after a safe-save: new contents for the original file id.
-            let r = self.block(self.client.upload(path, UploadTarget::Existing { id, if_match: None }, mtime, None));
-            if r.is_ok() {
+            let mut r = self.block(self.client.upload(path, UploadTarget::Existing { id, if_match: None, at: None }, mtime, None));
+            if matches!(r, Err(DavError::NotFound)) {
+                // The original is gone from the server: upload the replacement as a new file instead of dropping it.
+                final_name = self.block(self.client.available_name(&parent_id, name))?;
+                r = self.block(self.client.upload(path, UploadTarget::New { parent_id: &parent_id, name: &final_name }, mtime, None));
+            } else if r.is_ok() {
                 self.reattached.lock().insert(id.clone());
                 if let Ok(it) = &r {
                     if it.name != name || it.parent_id.as_deref() != Some(parent_id.as_str()) {
@@ -673,6 +677,9 @@ impl Shared {
             Work::DeleteFile { id, path } => {
                 if self.reattached.lock().remove(id) {
                     return Ok(true); // a safe-save moved this id onto the replacement file
+                }
+                if self.safe_saves.lock().values().any(|(sid, _, _)| sid == id) {
+                    return Ok(false); // a safe-save is waiting to re-use this id: decide once it is resolved
                 }
                 if path.exists() {
                     return Ok(true); // undeleted / replaced
@@ -1361,6 +1368,11 @@ fn retryable(e: &anyhow::Error) -> bool {
         Some(_) => false,
         None => true, // local I/O (e.g. file busy)
     }
+}
+
+/// Being offline or signed out is not the work's fault: keep it queued for as long as it takes.
+fn offline(e: &anyhow::Error) -> bool {
+    matches!(e.downcast_ref::<DavError>(), Some(DavError::Network(_)) | Some(DavError::Auth(_)))
 }
 
 fn backoff(tries: u32) -> Duration {
